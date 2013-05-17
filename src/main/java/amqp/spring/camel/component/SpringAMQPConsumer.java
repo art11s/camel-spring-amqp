@@ -4,6 +4,15 @@
 
 package amqp.spring.camel.component;
 
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.StringTokenizer;
+
 import org.aopalliance.aop.Advice;
 import org.apache.camel.Exchange;
 import org.apache.camel.ExchangePattern;
@@ -34,12 +43,7 @@ import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.retry.policy.NeverRetryPolicy;
 import org.springframework.retry.support.RetryTemplate;
 import org.springframework.util.ErrorHandler;
-
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.StringTokenizer;
+import org.springframework.util.StringUtils;
 
 public class SpringAMQPConsumer extends DefaultConsumer implements ConnectionListener {
     private static transient final Logger LOG = LoggerFactory.getLogger(SpringAMQPConsumer.class);
@@ -130,6 +134,10 @@ public class SpringAMQPConsumer extends DefaultConsumer implements ConnectionLis
             //Transactions are currently not supported
             this.listenerContainer.setChannelTransacted(false);
             this.listenerContainer.setAcknowledgeMode(AcknowledgeMode.NONE);
+        }
+        
+        public SimpleMessageListenerContainer getListenerContainer() {
+        	return listenerContainer;
         }
 
         public void start() {
@@ -270,11 +278,11 @@ public class SpringAMQPConsumer extends DefaultConsumer implements ConnectionLis
             super.execute(enrichedTask);
         }
 
-        @Override
+        /*@Override
         public void execute(final Runnable task, long startTimeout) {
             Runnable enrichedTask = new SpringAMQPExecutorTask(endpoint, task);
             super.execute(enrichedTask, startTimeout);
-        }
+        }*/
 
     }
 
@@ -348,47 +356,110 @@ public class SpringAMQPConsumer extends DefaultConsumer implements ConnectionLis
                 queueArguments.put(HA_POLICY_ARGUMENT, "all");
 
             //Declare queue
-            Queue queue = new Queue(this.endpoint.queueName, this.endpoint.durable, this.endpoint.exclusive, this.endpoint.autodelete, queueArguments);
-            this.endpoint.getAmqpAdministration().declareQueue(queue);
+            // add support for auto generated queue names by RabbitMQ to guarantee unique names accross JVMs
+            Queue queue;
+            if (StringUtils.hasText(this.endpoint.queueName)) {
+	            queue = new Queue(this.endpoint.queueName, this.endpoint.durable, this.endpoint.exclusive, this.endpoint.autodelete, queueArguments);
+	            this.endpoint.getAmqpAdministration().declareQueue(queue);
+            }
+            else {
+            	queue = this.endpoint.getAmqpAdministration().declareQueue();
+            	this.endpoint.queueName = queue.getName();
+            	messageListener.getListenerContainer().setQueueNames(queue.getName());
+            }
             LOG.info("Declared queue {} for endpoint {}.", queue.getName(), endpoint);
             return queue;
         }
 
-        protected Binding declareBinding(org.springframework.amqp.core.Exchange exchange, Queue queue) {
-            Binding binding = null;
+        protected void declareBinding(org.springframework.amqp.core.Exchange exchange, Queue queue) {
+            List<Binding> bindings = new ArrayList<Binding>();
 
             //Is this a header exchange? Bind the key/value pair(s)
             if(exchange instanceof HeadersExchange) {
                 if(this.endpoint.routingKey == null)
                     throw new IllegalStateException("Specified a header exchange without a key/value match");
 
-                if(this.endpoint.routingKey.contains("|") && this.endpoint.routingKey.contains("&"))
-                    throw new IllegalArgumentException("You cannot mix AND and OR expressions within a header binding");
-
-                Map<String, Object> keyValues = parseKeyValues(this.endpoint.routingKey);
-                BindingBuilder.HeadersExchangeMapConfigurer mapConfig = BindingBuilder.bind(queue).to((HeadersExchange) exchange);
-                if(this.endpoint.routingKey.contains("|"))
-                    binding = mapConfig.whereAny(keyValues).match();
-                else
-                    binding = mapConfig.whereAll(keyValues).match();
+                if(this.endpoint.routingKey.contains("|") && this.endpoint.routingKey.contains("&")) {
+                   // throw new IllegalArgumentException("You cannot mix AND and OR expressions within a header binding");
+                	// assume routingKey is of format A|B&C|D|E
+                	// parse into groups based on and condition
+                	StringTokenizer andTk = new StringTokenizer(endpoint.routingKey, "&");
+                    Map<Integer, List<String>> parameterMap = new HashMap<Integer, List<String>>();
+                    int groupNumber = 0;
+                    while(andTk.hasMoreTokens()) {
+                        String orGroupString = andTk.nextToken();
+                        List<String> orGroup = new ArrayList<String>();
+                        StringTokenizer orTk = new StringTokenizer(orGroupString, "|");
+                        while (orTk.hasMoreElements()) {
+                        	orGroup.add(orTk.nextToken());
+                        }
+                        parameterMap.put(groupNumber++, orGroup);
+                    }
+                    
+                    // generate combinations for each item in the group
+                    List<String[]> combinations = new ArrayList<String[]>();
+                    getCrossProduct(combinations, parameterMap, 0, new String[(parameterMap.size())]);
+                    
+                    // generate a binding for each combination
+                    for (String[] combination : combinations) {
+                    	Map<String, Object> pairs = new HashMap<String, Object>();
+                    	for (String keyValue : combination) {
+                    		String[] keyValueArray = keyValue.split("=");                                                    
+                            pairs.put(keyValueArray[0], keyValueArray[1]);
+                    	}
+                    	
+                    	 BindingBuilder.HeadersExchangeMapConfigurer mapConfig = BindingBuilder.bind(queue).to((HeadersExchange) exchange);
+                    	 bindings.add(mapConfig.whereAll(pairs).match());
+                    }
+                }
+                // handle case where keys could be the same (IN clause of selector)
+                else if(this.endpoint.routingKey.contains("|")) {
+                	StringTokenizer orTk = new StringTokenizer(this.endpoint.routingKey, "|");
+                    while (orTk.hasMoreElements()) {
+                    	String[] keyValueArray = orTk.nextToken().split("=");
+                    	 Map<String, Object> keyValues = new HashMap<String, Object>();
+                    	 keyValues.put(keyValueArray[0], keyValueArray[1]);
+                    	 BindingBuilder.HeadersExchangeMapConfigurer mapConfig = BindingBuilder.bind(queue).to((HeadersExchange) exchange);
+                    	 bindings.add(mapConfig.whereAll(keyValues).match());
+                    }
+                }
+                else {
+	                Map<String, Object> keyValues = parseKeyValues(this.endpoint.routingKey);
+	                BindingBuilder.HeadersExchangeMapConfigurer mapConfig = BindingBuilder.bind(queue).to((HeadersExchange) exchange);
+	                bindings.add(mapConfig.whereAll(keyValues).match());
+                }
 
             //Is this a fanout exchange? Just bind the queue and exchange directly
             } else if(exchange instanceof FanoutExchange) {
-                binding = BindingBuilder.bind(queue).to((FanoutExchange) exchange);
+            	bindings.add(BindingBuilder.bind(queue).to((FanoutExchange) exchange));
 
             //Perform routing key binding for direct or topic exchanges
             } else {
-                binding = BindingBuilder.bind(queue).to(exchange).with(this.endpoint.routingKey).noargs();
+            	bindings.add(BindingBuilder.bind(queue).to(exchange).with(this.endpoint.routingKey).noargs());
             }
 
             if (this.endpoint.isUsingDefaultExchange()) {
                 LOG.info("Using default exchange for endpoint {}.  Default exchange is implicitly bound to every queue, with a routing key equal to the queue name.", endpoint);
-            } else if (binding != null) {
-                LOG.info("Declaring binding {} for endpoint {}.", binding.getRoutingKey(), endpoint);
-                this.endpoint.getAmqpAdministration().declareBinding(binding);
+            } else {
+            	for (Binding binding : bindings) {
+	                LOG.info("Declaring binding {} for endpoint {}.", "key="+binding.getRoutingKey() +"; args="+ binding.getArguments(), endpoint);
+	                this.endpoint.getAmqpAdministration().declareBinding(binding);
+            	}
             }
 
-            return binding;
+        }
+    }
+    
+    private static void getCrossProduct(List<String[]> results, Map<Integer, List<String>> lists, int depth, String[] current)
+    {
+        for (int i = 0; i < lists.get(depth).size(); i++)
+        {
+            current[depth] = lists.get(depth).get(i);            
+            if (depth < lists.keySet().size() - 1)
+                getCrossProduct(results, lists, depth + 1, current);
+            else{
+                results.add(Arrays.copyOf(current,current.length));                
+            }
         }
     }
 }
